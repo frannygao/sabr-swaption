@@ -1,6 +1,9 @@
-"""sabr calibration, pricing and greeks for interest rate swaptions"""
+"""sabr calibration, pricing and greeks for interest rate swaptions
 
-import datetime as dt
+runs on real data only: a bloomberg vcub swaption vol snapshot and the matching sofr
+par curve. missing files or missing slices raise rather than substitute anything.
+"""
+
 import os
 
 import numpy as np
@@ -23,6 +26,7 @@ DARK_THEME = {
     'font.size': 11,
 }
 
+# strike grid used by the calibrated-parameter file format, offsets from atm in bp
 DEFAULT_OFFSETS_BP = np.array([-200, -100, -50, -25, 0, 25, 50, 100, 200])
 
 
@@ -201,43 +205,16 @@ def compute_greeks(forward, strike, expiry, alpha, beta, nu, rho, is_payer=True)
 
 # discount curve and annuity
 
-FRED_PAR_SERIES = {
-    1: 'DGS1', 2: 'DGS2', 3: 'DGS3', 5: 'DGS5',
-    7: 'DGS7', 10: 'DGS10', 20: 'DGS20', 30: 'DGS30',
-}
-
-
-def fetch_fred_par_curve(lookback_days=30):
-    """latest par rates from fred, as {maturity_years: rate}. returns {} on failure"""
-    try:
-        import pandas_datareader.data as pdr
-    except ImportError:
-        print('[curve] pandas-datareader not installed')
-        return {}
-
-    end = dt.date.today()
-    start = end - dt.timedelta(days=lookback_days)
-    par = {}
-    for maturity, series_id in FRED_PAR_SERIES.items():
-        try:
-            data = pdr.DataReader(series_id, 'fred', start, end).dropna()
-            if len(data):
-                par[maturity] = float(data.iloc[-1, 0]) / 100
-        except Exception:
-            continue
-    if par:
-        print(f'[curve] fred par rates: {len(par)} points, '
-              f'{min(par)}Y={par[min(par)]*100:.2f}% to {max(par)}Y={par[max(par)]*100:.2f}%')
-    else:
-        print('[curve] fred unavailable')
-    return par
-
-
 def load_par_curve(path='data/sofr_curve.csv'):
-    """par swap curve from file as {maturity_years: decimal rate}. empty if missing"""
+    """par swap curve from file as {maturity_years: decimal rate}
+
+    raises FileNotFoundError if the file is missing. there is no other source.
+    """
     if not os.path.exists(path):
-        print(f'[curve] no curve at {path}')
-        return {}
+        raise FileNotFoundError(
+            f"no SOFR curve at '{path}'. pricing needs a real discount curve "
+            "and none was found."
+        )
     frame = pd.read_csv(path, comment='#')
     par = {float(r['tenor_years']): float(r['rate_pct']) / 100 for _, r in frame.iterrows()}
     print(f'[curve] loaded {len(par)} par pillars from {path}, '
@@ -252,7 +229,7 @@ def bootstrap_discount_curve(par_rates, freq=2, day_count=360.0, basis_days=365.
     the rest are bootstrapped on a semi-annual fixed leg. returns (times, dfs).
     """
     if not par_rates:
-        return None
+        raise ValueError('no par rates to bootstrap')
 
     step = 1.0 / freq
     accrual = (basis_days / freq) / day_count
@@ -277,30 +254,42 @@ def bootstrap_discount_curve(par_rates, freq=2, day_count=360.0, basis_days=365.
     times = np.array([t for t, _ in merged])
     dfs = np.array([d for _, d in merged])
     if len(times) < 3:
-        return None
+        raise ValueError('not enough pillars to bootstrap a usable curve')
     return times, dfs
+
+
+def curve_max_time(curve):
+    return float(curve[0][-1])
 
 
 def discount_factor(curve, t):
     """log-linear interpolation on the bootstrapped curve
 
     beyond the last pillar the instantaneous forward of the final segment is held
-    flat, so long-dated swaps extrapolate instead of clamping to a constant df.
+    flat, which is what lets the 30y expiry into 30y tenor slice price at all since
+    it needs discount factors to 60y off a curve that stops at 30y. extrapolation
+    is capped at twice the curve's last pillar; a tenor needing more than that
+    raises instead of extrapolating silently.
     """
     times, dfs = curve
-    t = np.asarray(t, dtype=float)
+    last = times[-1]
+    cap = 2.0 * last
+
+    t_arr = np.asarray(t, dtype=float)
+    max_t = float(np.max(t_arr))
+    if max_t > cap:
+        raise ValueError(
+            f'curve covers to {last:.2f}y and extrapolates to {cap:.2f}y, '
+            f'requested time {max_t:.2f}y is beyond that'
+        )
+
     log_dfs = np.log(dfs)
-    log_df = np.interp(t, times, log_dfs)
-
+    log_df = np.interp(t_arr, times, log_dfs)
     slope = (log_dfs[-1] - log_dfs[-2]) / (times[-1] - times[-2])
-    beyond = t > times[-1]
+    beyond = t_arr > last
     if np.any(beyond):
-        log_df = np.where(beyond, log_dfs[-1] + (t - times[-1]) * slope, log_df)
+        log_df = np.where(beyond, log_dfs[-1] + (t_arr - last) * slope, log_df)
     return np.exp(log_df)
-
-
-def curve_max_time(curve):
-    return float(curve[0][-1])
 
 
 def swap_schedule(expiry_years, tenor_years, freq=2):
@@ -327,73 +316,18 @@ def forward_swap_rate(curve, expiry_years, tenor_years, freq=2,
     return (df_start - df_end) / ann
 
 
-def flat_annuity(forward, tenor_years, freq=2):
-    """fallback annuity under a flat discount rate, not a market curve"""
-    n = int(round(tenor_years * freq))
-    step = 1.0 / freq
-    return float(np.sum([step / (1 + forward * step) ** (i + 1) for i in range(n)]))
-
-
 def price_swaption(forward, strike, expiry_years, tenor_years, alpha, beta, nu, rho,
-                   curve=None, notional=1.0, is_payer=True):
-    """black-76 swaption price under the annuity measure
-
-    uses the bootstrapped curve when given, otherwise a flat-discount annuity.
-    """
+                   curve, notional=1.0, is_payer=True):
+    """black-76 swaption price under the annuity measure of a real discount curve"""
+    if curve is None:
+        raise ValueError('price_swaption needs a bootstrapped discount curve')
     vol = float(hagan_implied_vol(strike, forward, expiry_years, alpha, beta, nu, rho))
     unit = black_price(forward, strike, expiry_years, vol, is_payer)
-    if curve is not None:
-        ann = annuity_from_curve(curve, expiry_years, tenor_years)
-        annuity_label = 'bootstrapped curve'
-    else:
-        ann = flat_annuity(forward, tenor_years)
-        annuity_label = 'approximate annuity (flat discount)'
-    return {
-        'vol': vol, 'unit_price': unit, 'annuity': ann,
-        'price': unit * ann * notional, 'annuity_label': annuity_label,
-    }
+    ann = annuity_from_curve(curve, expiry_years, tenor_years)
+    return {'vol': vol, 'unit_price': unit, 'annuity': ann, 'price': unit * ann * notional}
 
 
 # data
-
-def build_smile_from_atm(atm_forward, atm_vol, strike_offsets_bp=None,
-                         skew_strength=-0.3, curvature_strength=0.8):
-    """synthetic smile shape around a given atm level"""
-    if strike_offsets_bp is None:
-        strike_offsets_bp = DEFAULT_OFFSETS_BP
-    strikes = atm_forward + np.asarray(strike_offsets_bp) / 10000
-    moneyness = (strikes - atm_forward) / atm_forward
-    skew = skew_strength * moneyness * atm_vol
-    curvature = curvature_strength * moneyness**2 * atm_vol
-    implied_vols = np.maximum(atm_vol + skew + curvature, 0.005)
-    return strikes, implied_vols
-
-
-def generate_sample_vol_surface(expiries=(1, 2, 5, 10), tenors=(2, 5, 10),
-                                strike_offsets_bp=None):
-    """fully synthetic lognormal vol surface"""
-    if strike_offsets_bp is None:
-        strike_offsets_bp = DEFAULT_OFFSETS_BP
-    surface = {}
-    for expiry in expiries:
-        for tenor in tenors:
-            atm_forward = 0.03 + 0.002 * tenor + 0.001 * expiry
-            strikes = atm_forward + strike_offsets_bp / 10000
-
-            atm_vol = 0.20 + 0.05 * np.exp(-0.1 * expiry) + 0.01 * tenor
-            skew = -0.0015 * (strikes - atm_forward) / atm_forward
-            curvature = 0.8 * ((strikes - atm_forward) / atm_forward) ** 2
-            noise = np.random.RandomState(42 + expiry * 10 + tenor).normal(0, 0.002, len(strikes))
-
-            implied_vols = np.maximum(atm_vol + skew + curvature + noise, 0.01)
-
-            surface[(expiry, tenor)] = {
-                'strikes': strikes, 'atm_forward': atm_forward,
-                'implied_vols': implied_vols, 'strike_offsets_bp': strike_offsets_bp,
-                'source': 'synthetic', 'vol_model': 'lognormal',
-            }
-    return surface, list(expiries), list(tenors)
-
 
 def parse_term(label):
     """'3Mo' or '10Yr' to years"""
@@ -423,15 +357,19 @@ def load_vcub_snapshot(path='data/vcub_snapshot.csv', strike_offsets_bp=None):
     """load a vcub snapshot keyed by (expiry, tenor)
 
     accepts a raw-quote file (expiry, tenor, strike, implied_vol, atm_forward, date)
-    or a calibrated-parameter file (expiry, tenor, F_pct, alpha, rho, nu, ...).
-    returns an empty dict if the file is missing.
+    or a calibrated-parameter file (expiry, tenor, F_pct, alpha, rho, nu, ...), and
+    for the latter reconstructs each smile from its own parameters. raises
+    FileNotFoundError if the file is missing and ValueError if its columns match
+    neither layout.
     """
     if strike_offsets_bp is None:
         strike_offsets_bp = DEFAULT_OFFSETS_BP
 
     if not os.path.exists(path):
-        print(f'[vcub] no snapshot at {path}, falling back to synthetic data')
-        return {}
+        raise FileNotFoundError(
+            f"no VCUB snapshot at '{path}'. this notebook runs on real quotes only "
+            "and does not generate a substitute."
+        )
 
     frame = pd.read_csv(path, comment='#')
     snapshot_date = _read_header_date(path)
@@ -480,75 +418,21 @@ def load_vcub_snapshot(path='data/vcub_snapshot.csv', strike_offsets_bp=None):
                 'ref_rho': float(row['rho']),
                 'ref_rmse_bp': float(row.get('rmse_bp', np.nan)),
                 'ref_atm_vol_bp': float(row.get('atm_vol_bp', np.nan)),
-                'density_viol': int(row.get('density_viol', 0)),
-                'any_flag': bool(row.get('any_flag', False)),
             }
         print(f'[vcub] loaded {len(snapshot)} slices of calibrated parameters, date {snapshot_date}')
         print('[vcub] smiles are reconstructed from vcub sabr parameters, not raw strike quotes')
         return snapshot
 
-    print(f'[vcub] unrecognised columns in {path}, falling back to synthetic data')
-    return {}
+    raise ValueError(
+        f"columns in '{path}' match neither the raw-quote layout "
+        "(expiry, tenor, strike, implied_vol, atm_forward) nor the calibrated-parameter "
+        "layout (expiry, tenor, F_pct, alpha, nu, rho)."
+    )
 
 
-def fred_atm_level(lookback_days=500):
-    """latest 10y rate and its historical vol from fred, as a fallback atm proxy"""
-    try:
-        import pandas_datareader.data as pdr
-    except ImportError:
-        print('[fred] pandas-datareader not installed')
-        return None
-
-    end = dt.date.today()
-    start = end - dt.timedelta(days=lookback_days)
-    for series_id, label in [('DSWP10', '10y swap rate'), ('DGS10', '10y treasury')]:
-        try:
-            data = pdr.DataReader(series_id, 'fred', start, end).dropna()
-        except Exception:
-            continue
-        if len(data) <= 50:
-            continue
-        rates = data.iloc[:, 0].to_numpy(float) / 100
-        rates = rates[rates > 0]
-        hist_vol = float(np.std(np.diff(np.log(rates))) * np.sqrt(252))
-        print(f'[fred] {label}: {rates[-1]*100:.2f}%, historical vol {hist_vol*100:.1f}%')
-        return {'rate': float(rates[-1]), 'hist_vol': hist_vol, 'series': series_id}
-
-    print('[fred] no usable series')
-    return None
-
-
-def build_fallback_slice(expiry_years, tenor_years, fred_level=None,
-                         strike_offsets_bp=None):
-    """derived or synthetic slice for an (expiry, tenor) with no vcub quotes"""
-    if strike_offsets_bp is None:
-        strike_offsets_bp = DEFAULT_OFFSETS_BP
-
-    if fred_level is not None:
-        atm_forward = fred_level['rate'] + 0.001 * expiry_years
-        atm_vol = fred_level['hist_vol'] * (1 + 0.1 * np.exp(-0.15 * expiry_years))
-        source = 'FRED'
-    else:
-        atm_forward = 0.03 + 0.002 * tenor_years + 0.001 * expiry_years
-        atm_vol = 0.20 + 0.05 * np.exp(-0.1 * expiry_years) + 0.01 * tenor_years
-        source = 'synthetic'
-
-    strikes, vols = build_smile_from_atm(atm_forward, atm_vol, strike_offsets_bp)
-    return {
-        'strikes': strikes, 'implied_vols': vols, 'atm_forward': atm_forward,
-        'strike_offsets_bp': np.asarray(strike_offsets_bp),
-        'source': source, 'vol_model': 'lognormal',
-        'quote_kind': 'real atm level, synthetic smile' if source == 'FRED' else 'fully synthetic',
-        'date': 'derived', 'expiry_years': expiry_years, 'tenor_years': tenor_years,
-    }
-
-
-SOURCE_LABELS = {
-    'VCUB': 'VCUB (market observed)',
-    'FRED': 'FRED ATM level, synthetic smile (derived)',
-    'synthetic': 'synthetic (not market data)',
-}
-
-
-def source_label(source):
-    return SOURCE_LABELS.get(source, source)
+def require_slice(snapshot, expiry, tenor):
+    """look up a (expiry, tenor) slice, raising KeyError by name if it is absent"""
+    key = (expiry, tenor)
+    if key not in snapshot:
+        raise KeyError(f'no VCUB quotes for {expiry} into {tenor}')
+    return snapshot[key]
