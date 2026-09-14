@@ -1,7 +1,7 @@
 """sabr calibration, pricing and greeks for interest rate swaptions
 
 runs on real data only: a bloomberg vcub swaption vol snapshot and the matching sofr
-par curve. missing files or missing slices raise rather than substitute anything.
+par curve
 """
 
 import os
