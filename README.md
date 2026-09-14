@@ -74,4 +74,4 @@ Computed by finite difference:
 
 ## Running it
 
-Install dependencies, open the notebook, run cells in order. It runs on the included VCUB snapshot only, one day, 2026-07-28, 91 expiry/tenor slices. There is no fallback source: a slice outside that grid is not priced, and a missing snapshot or curve file raises an error instead of substituting anything.
+Install dependencies, open the notebook, run cells in order. It runs on the included VCUB snapshot only, one day, 2026-07-28, 91 expiry/tenor slices. 
