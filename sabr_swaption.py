@@ -233,50 +233,74 @@ def fetch_fred_par_curve(lookback_days=30):
     return par
 
 
-def bootstrap_discount_curve(par_rates, freq=2, day_count=360.0, basis_days=365.0):
-    """bootstrap discount factors from par swap rates on a semi-annual schedule
+def load_par_curve(path='data/sofr_curve.csv'):
+    """par swap curve from file as {maturity_years: decimal rate}. empty if missing"""
+    if not os.path.exists(path):
+        print(f'[curve] no curve at {path}')
+        return {}
+    frame = pd.read_csv(path, comment='#')
+    par = {float(r['tenor_years']): float(r['rate_pct']) / 100 for _, r in frame.iterrows()}
+    print(f'[curve] loaded {len(par)} par pillars from {path}, '
+          f'{min(par)}Y={par[min(par)]*100:.3f}% to {max(par)}Y={par[max(par)]*100:.3f}%')
+    return par
 
-    par_rates maps maturity in years to a par rate. returns (times, discount_factors).
+
+def bootstrap_discount_curve(par_rates, freq=2, day_count=360.0, basis_days=365.0):
+    """bootstrap discount factors from par swap rates
+
+    pillars below the first coupon date are treated as simple-compounded deposits,
+    the rest are bootstrapped on a semi-annual fixed leg. returns (times, dfs).
     """
     if not par_rates:
         return None
 
-    maturities = sorted(par_rates)
-    grid_pillars = sorted(par_rates)
-    times = [0.0]
-    dfs = [1.0]
-
     step = 1.0 / freq
     accrual = (basis_days / freq) / day_count
+    pillars = sorted(par_rates)
 
-    max_mat = maturities[-1]
-    n_steps = int(round(max_mat * freq))
-    curve_t, curve_df = [0.0], [1.0]
+    short = [(t, 1.0 / (1.0 + par_rates[t] * t)) for t in pillars if t < step]
 
+    times, dfs = [0.0], [1.0]
     annuity = 0.0
+    n_steps = int(round(max(pillars) * freq))
     for i in range(1, n_steps + 1):
         t = i * step
-        par = float(np.interp(t, grid_pillars, [par_rates[m] for m in grid_pillars]))
+        par = float(np.interp(t, pillars, [par_rates[m] for m in pillars]))
         df = (1.0 - par * annuity) / (1.0 + par * accrual)
         if df <= 0:
             break
         annuity += accrual * df
-        curve_t.append(t)
-        curve_df.append(df)
+        times.append(t)
+        dfs.append(df)
 
-    times = np.array(curve_t)
-    dfs = np.array(curve_df)
+    merged = sorted(set(short + list(zip(times, dfs))))
+    times = np.array([t for t, _ in merged])
+    dfs = np.array([d for _, d in merged])
     if len(times) < 3:
         return None
     return times, dfs
 
 
 def discount_factor(curve, t):
-    """log-linear interpolation on the bootstrapped curve"""
+    """log-linear interpolation on the bootstrapped curve
+
+    beyond the last pillar the instantaneous forward of the final segment is held
+    flat, so long-dated swaps extrapolate instead of clamping to a constant df.
+    """
     times, dfs = curve
     t = np.asarray(t, dtype=float)
-    log_df = np.interp(t, times, np.log(dfs))
+    log_dfs = np.log(dfs)
+    log_df = np.interp(t, times, log_dfs)
+
+    slope = (log_dfs[-1] - log_dfs[-2]) / (times[-1] - times[-2])
+    beyond = t > times[-1]
+    if np.any(beyond):
+        log_df = np.where(beyond, log_dfs[-1] + (t - times[-1]) * slope, log_df)
     return np.exp(log_df)
+
+
+def curve_max_time(curve):
+    return float(curve[0][-1])
 
 
 def swap_schedule(expiry_years, tenor_years, freq=2):
@@ -420,16 +444,18 @@ def load_vcub_snapshot(path='data/vcub_snapshot.csv', strike_offsets_bp=None):
             group = group.sort_values('strike')
             atm_forward = float(group['atm_forward'].iloc[0])
             date = str(group['date'].iloc[0]) if 'date' in columns else snapshot_date
+            vol_model = str(group['vol_model'].iloc[0]) if 'vol_model' in columns else 'lognormal'
             snapshot[(str(expiry), str(tenor))] = {
                 'strikes': group['strike'].to_numpy(float),
                 'implied_vols': group['implied_vol'].to_numpy(float),
                 'atm_forward': atm_forward,
                 'strike_offsets_bp': (group['strike'].to_numpy(float) - atm_forward) * 10000,
-                'date': date, 'source': 'VCUB', 'quote_kind': 'raw quotes',
-                'vol_model': 'lognormal',
+                'date': date, 'source': 'VCUB', 'quote_kind': 'raw market quotes',
+                'vol_model': vol_model,
                 'expiry_years': parse_term(expiry), 'tenor_years': parse_term(tenor),
             }
-        print(f'[vcub] loaded {len(snapshot)} slices of raw quotes, date {snapshot_date}')
+        n_quotes = len(frame)
+        print(f'[vcub] loaded {len(snapshot)} smiles, {n_quotes} raw quotes, date {snapshot_date}')
         return snapshot
 
     if {'alpha', 'nu', 'rho', 'F_pct'} <= columns:
